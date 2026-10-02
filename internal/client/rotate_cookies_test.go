@@ -30,6 +30,7 @@ func TestRotateGaiaCookiesAppliesSetCookie(t *testing.T) {
 		gotUA       string
 		gotCookie   string
 		gotMethod   string
+		gotFetch    string
 	)
 	auth := libgm.NewAuthData()
 	auth.SetCookies(map[string]string{
@@ -53,6 +54,7 @@ func TestRotateGaiaCookiesAppliesSetCookie(t *testing.T) {
 		gotType = req.Header.Get("Content-Type")
 		gotUA = req.Header.Get("User-Agent")
 		gotCookie = req.Header.Get("Cookie")
+		gotFetch = req.Header.Get("Sec-Fetch-Site")
 		header := make(http.Header)
 		header.Add("Set-Cookie", "__Secure-1PSIDTS="+rotated+"; Path=/; Secure")
 		header.Add("Set-Cookie", "__Secure-3PSIDTS=psidts3-rotated; Path=/; Secure")
@@ -90,11 +92,15 @@ func TestRotateGaiaCookiesAppliesSetCookie(t *testing.T) {
 	if gotUA != util.UserAgent {
 		t.Fatalf("user agent = %q, want %q", gotUA, util.UserAgent)
 	}
-	if !strings.Contains(gotCookie, "SID=sid-stable") || !strings.Contains(gotCookie, "SAPISID=sap-stable") || !strings.Contains(gotCookie, "__Secure-1PSID=psid-stable") {
-		t.Fatal("request did not send the stored account cookies")
+	if !strings.Contains(gotCookie, "__Secure-1PSID=psid-stable") || !strings.Contains(gotCookie, "__Secure-1PSIDTS=psidts-stale") {
+		t.Fatalf("first attempt = %s, want the __Secure-1PSID pair", gotCookie)
 	}
-	if strings.Contains(gotCookie, "OSID=") || strings.Contains(gotCookie, "COMPASS=") {
-		t.Fatalf("request sent messages-host cookies to accounts.google.com: %s", gotCookie)
+	sentNames := cookieNames(gotCookie)
+	if strings.Join(sentNames, ",") != "__Secure-1PSID,__Secure-1PSIDTS" {
+		t.Fatalf("first attempt cookies = %v", sentNames)
+	}
+	if gotFetch != "" {
+		t.Fatalf("first attempt sent Sec-Fetch-Site %q", gotFetch)
 	}
 	if strings.Contains(errString(err), rotated) {
 		t.Fatal("error included a cookie value")
@@ -141,10 +147,13 @@ func TestRotateGaiaCookiesRejectionKeepsCookies(t *testing.T) {
 		"OSID":             "messages-osid-" + secret,
 	})
 	var cookies []string
+	var fetches []string
 	doer := doerFunc(func(req *http.Request) (*http.Response, error) {
 		cookies = append(cookies, req.Header.Get("Cookie"))
+		fetches = append(fetches, req.Header.Get("Sec-Fetch-Site"))
 		header := make(http.Header)
 		header.Set("Content-Type", "text/html; charset=utf-8")
+		header.Set("Sec-Session-Google-Challenge", secret)
 		header.Add("Set-Cookie", "NID="+secret+"; Path=/")
 		return &http.Response{
 			StatusCode: http.StatusUnauthorized,
@@ -160,17 +169,23 @@ func TestRotateGaiaCookiesRejectionKeepsCookies(t *testing.T) {
 	if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "messages-osid") {
 		t.Fatalf("rejection error included a cookie value: %v", err)
 	}
-	if len(cookies) != 2 {
-		t.Fatalf("attempts = %d, want a PSIDTS retry after 401", len(cookies))
+	if len(cookies) != 3 {
+		t.Fatalf("attempts = %d, want psid_pair, psid_only, then account", len(cookies))
 	}
-	if !strings.Contains(cookies[0], "__Secure-1PSIDTS=") || strings.Contains(cookies[0], "OSID=") {
+	if cookies[0] != "__Secure-1PSID=psid-stable; __Secure-1PSIDTS="+secret {
 		t.Fatalf("first cookie header = %s", cookies[0])
 	}
-	if strings.Contains(cookies[1], "PSIDTS") || strings.Contains(cookies[1], "OSID=") {
-		t.Fatalf("retry cookie header = %s", cookies[1])
+	if cookies[1] != "__Secure-1PSID=psid-stable" {
+		t.Fatalf("second cookie header = %s", cookies[1])
 	}
-	if !strings.Contains(cookies[1], "__Secure-1PSID=psid-stable") || !strings.Contains(cookies[1], "SID=sid-stable") {
-		t.Fatalf("retry dropped the long-lived cookies: %s", cookies[1])
+	if strings.Contains(cookies[2], "PSIDTS") || strings.Contains(cookies[2], "OSID=") {
+		t.Fatalf("account retry = %s", cookies[2])
+	}
+	if !strings.Contains(cookies[2], "SID=sid-stable") || !strings.Contains(cookies[2], "SAPISID=sap-stable") {
+		t.Fatalf("account retry dropped the long-lived cookies: %s", cookies[2])
+	}
+	if fetches[0] != "" || fetches[1] != "" || fetches[2] != "same-origin" {
+		t.Fatalf("Sec-Fetch-Site by attempt = %v", fetches)
 	}
 	var details *GaiaRotateError
 	if !errors.As(err, &details) {
@@ -181,6 +196,17 @@ func TestRotateGaiaCookiesRejectionKeepsCookies(t *testing.T) {
 	}
 	if strings.Join(details.Sent, ",") != "SAPISID,SID,__Secure-1PSID" {
 		t.Fatalf("sent = %v", details.Sent)
+	}
+	if !strings.Contains(err.Error(), "tries=3") || !strings.Contains(err.Error(), "trace=psid_pair:401:2,psid_only:401:1,account:401:3") {
+		t.Fatalf("error = %v", err)
+	}
+	typeAt := strings.Index(err.Error(), "content_type=")
+	sentAt := strings.Index(err.Error(), " sent=")
+	if typeAt < 0 || sentAt < 0 || typeAt > sentAt || !strings.Contains(err.Error(), "body_len=") || !strings.Contains(err.Error(), "sent_count=3") {
+		t.Fatalf("diagnostic order = %s", err.Error())
+	}
+	if !strings.Contains(err.Error(), "Sec-Session-Google-Challenge") {
+		t.Fatalf("response header name missing: %s", err.Error())
 	}
 	if strings.Join(details.Received, ",") != "NID" {
 		t.Fatalf("received = %v", details.Received)
@@ -349,6 +375,90 @@ func TestRotateGaiaCookiesRetriesWithoutStalePSIDTS(t *testing.T) {
 	}
 }
 
+func TestRotateGaiaCookies403FallsBackAndRecovers(t *testing.T) {
+	ResetGaiaCookieRotationState()
+	t.Cleanup(ResetGaiaCookieRotationState)
+
+	const secret = "psidts-stale-secret"
+	auth := libgm.NewAuthData()
+	auth.SetCookies(map[string]string{
+		"SID":              "sid-stable",
+		"HSID":             "hsid-stable",
+		"SSID":             "ssid-stable",
+		"APISID":           "ap-stable",
+		"SAPISID":          "sap-stable",
+		"__Secure-1PSID":   "psid-stable",
+		"__Secure-3PSID":   "psid3-stable",
+		"__Secure-1PSIDTS": secret,
+		"__Secure-3PSIDTS": "psidts3-stale",
+		"SIDCC":            "sidcc-stale",
+		"__Secure-1PSIDCC": "cc1-stale",
+		"__Secure-3PSIDCC": "cc3-stale",
+		"NID":              "nid-stale",
+		"OSID":             "messages-osid",
+	})
+	var variants []string
+	doer := doerFunc(func(req *http.Request) (*http.Response, error) {
+		cookie := req.Header.Get("Cookie")
+		if strings.Contains(cookie, "OSID=") || strings.Contains(cookie, "SIDCC=") || strings.Contains(cookie, "PSIDCC=") || strings.Contains(cookie, "NID=") {
+			t.Fatalf("sent a rotating or host cookie: %s", cookie)
+		}
+		header := make(http.Header)
+		switch {
+		case strings.Contains(cookie, "__Secure-1PSIDTS="):
+			variants = append(variants, "psid_pair")
+			return &http.Response{
+				StatusCode: http.StatusForbidden,
+				Header:     header,
+				Body:       io.NopCloser(strings.NewReader("no")),
+				Request:    req,
+			}, nil
+		case cookie == "__Secure-1PSID=psid-stable":
+			variants = append(variants, "psid_only")
+			if req.Header.Get("Sec-Fetch-Site") != "" {
+				t.Fatal("psid_only sent Sec-Fetch-Site")
+			}
+			return &http.Response{
+				StatusCode: http.StatusForbidden,
+				Header:     header,
+				Body:       io.NopCloser(strings.NewReader("no")),
+				Request:    req,
+			}, nil
+		default:
+			variants = append(variants, "account")
+			if req.Header.Get("Sec-Fetch-Site") != "same-origin" || req.Header.Get("Referer") != "https://accounts.google.com/" {
+				t.Fatalf("account headers origin fetch/referer = %q / %q", req.Header.Get("Sec-Fetch-Site"), req.Header.Get("Referer"))
+			}
+			if req.Header.Get("Authorization") != "" || req.Header.Get("X-Goog-AuthUser") != "" {
+				t.Fatal("account attempt sent an auth header")
+			}
+			header.Add("Set-Cookie", "__Secure-1PSIDTS=psidts-fresh; Path=/; Secure")
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     header,
+				Body:       io.NopCloser(strings.NewReader(")]}'\n[[\"identity.hfcr\",600]]")),
+				Request:    req,
+			}, nil
+		}
+	})
+	res, err := RotateGaiaCookies(context.Background(), auth, doer)
+	if err != nil {
+		t.Fatalf("RotateGaiaCookies() error = %v", err)
+	}
+	if strings.Join(variants, ",") != "psid_pair,psid_only,account" {
+		t.Fatalf("variants = %v", variants)
+	}
+	auth.CookiesLock.RLock()
+	got := auth.Cookies["__Secure-1PSIDTS"]
+	auth.CookiesLock.RUnlock()
+	if got != "psidts-fresh" {
+		t.Fatalf("PSIDTS = %q", got)
+	}
+	if strings.Join(res.UpdatedNames, ",") != "__Secure-1PSIDTS" {
+		t.Fatalf("updated = %v", res.UpdatedNames)
+	}
+}
+
 func TestRotateGaiaCookiesForbiddenDoesNotDropPSIDTS(t *testing.T) {
 	ResetGaiaCookieRotationState()
 	t.Cleanup(ResetGaiaCookieRotationState)
@@ -456,6 +566,15 @@ func TestPersistCookiesNowBypassesEventThrottle(t *testing.T) {
 type doerFunc func(*http.Request) (*http.Response, error)
 
 func (f doerFunc) Do(req *http.Request) (*http.Response, error) { return f(req) }
+
+func cookieNames(header string) []string {
+	req := &http.Request{Header: http.Header{"Cookie": {header}}}
+	var names []string
+	for _, cookie := range req.Cookies() {
+		names = append(names, cookie.Name)
+	}
+	return names
+}
 
 func copyMap(in map[string]string) map[string]string {
 	out := make(map[string]string, len(in))

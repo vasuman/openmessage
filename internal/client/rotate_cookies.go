@@ -46,10 +46,50 @@ var gaiaAccountsCookieAllow = map[string]struct{}{
 
 // gaiaTimestampCookies are the short-lived cookies a still-open browser
 // rotates out from under a copied session. Sending the stale pair can make
-// RotateCookies return 401 even though SID / __Secure-1PSID still work.
+// RotateCookies refuse the call even though SID / __Secure-1PSID still work.
 var gaiaTimestampCookies = map[string]struct{}{
 	"__Secure-1PSIDTS": {},
 	"__Secure-3PSIDTS": {},
+}
+
+// gaiaPSIDPairAllow is the cookie set measured to rotate __Secure-1PSIDTS.
+// gemini-web2api-go found that sending anything beyond this pair returns 401.
+// Gemini-API likewise treats __Secure-1PSID as the required input and PSIDTS
+// as optional.
+var gaiaPSIDPairAllow = map[string]struct{}{
+	"__Secure-1PSID":   {},
+	"__Secure-1PSIDTS": {},
+}
+
+var gaiaPSIDOnlyAllow = map[string]struct{}{
+	"__Secure-1PSID": {},
+}
+
+// gaiaAccountStableAllow is the long-lived .google.com identity set. SIDCC,
+// NID, and the *PSIDCC / *PSIDTS cookies rotate and are left off: a stale
+// copy of those is a plausible reason for a refusal.
+var gaiaAccountStableAllow = map[string]struct{}{
+	"SID":               {},
+	"HSID":              {},
+	"SSID":              {},
+	"APISID":            {},
+	"SAPISID":           {},
+	"__Secure-1PAPISID": {},
+	"__Secure-3PAPISID": {},
+	"__Secure-1PSID":    {},
+	"__Secure-3PSID":    {},
+}
+
+// gaiaBrowserFetchHeaders is the same-origin fetch metadata Chrome attaches
+// to the RotateCookies XHR. It is not part of the minimal request Gemini-API
+// and notebooklm-py use successfully, so it is only a later attempt. Sec-CH-UA
+// is intentionally absent: those values claim a Chrome TLS fingerprint this
+// process does not have, and a mismatch is itself a common 403.
+var gaiaBrowserFetchHeaders = map[string]string{
+	"Referer":        "https://accounts.google.com/",
+	"Sec-Fetch-Dest": "empty",
+	"Sec-Fetch-Mode": "cors",
+	"Sec-Fetch-Site": "same-origin",
 }
 
 const (
@@ -88,24 +128,42 @@ const (
 var ErrGaiaCookiesUnavailable = errors.New("google session has no account cookies")
 
 // ErrGaiaCookiesRejected means accounts.google.com returned 401 or 403 for
-// the account cookies, including a second attempt that omitted the PSIDTS
-// pair. Callers keep the Messages connection up: this refusal is not itself
-// a disconnect. A later Messages 401 still falls through to Chrome import or
-// a re-pair when rotation cannot mint new cookies.
+// every cookie and header variant. Callers keep the Messages connection up:
+// this refusal is not itself a disconnect. A later Messages 401 still falls
+// through to Chrome import or a re-pair when rotation cannot mint new cookies.
 var ErrGaiaCookiesRejected = errors.New("google rejected the session cookies")
 
+// GaiaRotateAttempt is one RotateCookies POST. Names and counts only.
+type GaiaRotateAttempt struct {
+	Variant         string
+	Status          int
+	Sent            []string
+	Received        []string
+	Dropped         []string
+	ContentType     string
+	BodyLen         int
+	ResponseHeaders []string
+}
+
 // GaiaRotateError is a RotateCookies failure with enough context to tell a
-// bad request from a dead session. Cookie values and response bodies are
-// never included: a 401 body can echo material from the request.
+// bad request from a dead session. Cookie values, header values, and response
+// bodies are never included.
+//
+// Status, Sent, and the other singular fields describe the last attempt.
+// Attempts and the error string's trace list every try, with content-type
+// and body length ahead of the cookie names so a truncated log line still
+// shows the refusal and the retries.
 type GaiaRotateError struct {
-	Status        int
-	Sent          []string
-	Received      []string
-	Dropped       []string
-	ContentType   string
-	BodyLen       int
-	OmittedPSIDTS bool
-	Err           error
+	Status          int
+	Sent            []string
+	Received        []string
+	Dropped         []string
+	ContentType     string
+	BodyLen         int
+	OmittedPSIDTS   bool
+	ResponseHeaders []string
+	Attempts        []GaiaRotateAttempt
+	Err             error
 }
 
 func (e *GaiaRotateError) Error() string {
@@ -116,12 +174,33 @@ func (e *GaiaRotateError) Error() string {
 	if e.Err != nil {
 		base = e.Err.Error()
 	}
-	msg := fmt.Sprintf("%s: status=%d sent=%s received=%s content_type=%q body_len=%d omitted_psidts=%t",
-		base, e.Status, strings.Join(e.Sent, ","), strings.Join(e.Received, ","), e.ContentType, e.BodyLen, e.OmittedPSIDTS)
+	tries := len(e.Attempts)
+	if tries == 0 {
+		tries = 1
+	}
+	msg := fmt.Sprintf("%s: tries=%d trace=%s last_status=%d content_type=%q body_len=%d sent_count=%d sent=%s received=%s",
+		base, tries, e.attemptTrace(), e.Status, e.ContentType, e.BodyLen, len(e.Sent), strings.Join(e.Sent, ","), strings.Join(e.Received, ","))
 	if len(e.Dropped) > 0 {
 		msg += " dropped=" + strings.Join(e.Dropped, ",")
 	}
+	if len(e.ResponseHeaders) > 0 {
+		msg += " response_headers=" + strings.Join(e.ResponseHeaders, ",")
+	}
 	return msg
+}
+
+func (e *GaiaRotateError) attemptTrace() string {
+	if e == nil {
+		return ""
+	}
+	if len(e.Attempts) == 0 {
+		return fmt.Sprintf("request:%d:%d", e.Status, len(e.Sent))
+	}
+	parts := make([]string, len(e.Attempts))
+	for i, attempt := range e.Attempts {
+		parts[i] = fmt.Sprintf("%s:%d:%d", attempt.Variant, attempt.Status, len(attempt.Sent))
+	}
+	return strings.Join(parts, ",")
 }
 
 func (e *GaiaRotateError) Unwrap() error {
@@ -139,12 +218,23 @@ func AnnotateGaiaRotateLog(ev *zerolog.Event, err error) *zerolog.Event {
 	}
 	var details *GaiaRotateError
 	if errors.As(err, &details) && details != nil {
-		ev = ev.Int("status", details.Status).
-			Strs("sent_cookies", details.Sent).
-			Strs("received_cookies", details.Received).
+		tries := len(details.Attempts)
+		if tries == 0 {
+			tries = 1
+		}
+		ev = ev.Int("tries", tries).
+			Str("trace", details.attemptTrace()).
+			Int("status", details.Status).
+			Int("last_status", details.Status).
 			Str("content_type", details.ContentType).
 			Int("body_len", details.BodyLen).
+			Int("sent_count", len(details.Sent)).
+			Strs("sent_cookies", details.Sent).
+			Strs("received_cookies", details.Received).
 			Bool("omitted_psidts", details.OmittedPSIDTS)
+		if len(details.ResponseHeaders) > 0 {
+			ev = ev.Strs("response_headers", details.ResponseHeaders)
+		}
 		if len(details.Dropped) > 0 {
 			ev = ev.Strs("dropped_cookies", details.Dropped)
 		}
@@ -248,54 +338,132 @@ func RotateGaiaCookies(ctx context.Context, auth *libgm.AuthData, doer HTTPDoer)
 	if doer == nil {
 		doer = gaiaRotateHTTPClient
 	}
-	// Gemini-API and notebooklm-py POST this exact body with Content-Type
-	// application/json and Origin https://accounts.google.com. They do not
-	// send Authorization, SAPISIDHASH, or X-Goog-AuthUser. The user agent is
-	// libgm's Chrome string; those clients succeed with their own HTTP
-	// client's default agent, so a desktop-vs-Android UA is not what makes
-	// Google return 401.
-	first, err := postGaiaRotate(ctx, auth, doer, nil)
-	if err != nil {
-		return GaiaRotateResult{}, err
-	}
-	// A copied PSIDTS goes stale when the browser that minted it keeps
-	// calling RotateCookies. Google then rejects this POST while Messages
-	// still accepts SID and __Secure-1PSID. One retry without the timestamp
-	// cookies distinguishes that from a dead session.
-	if first.status == http.StatusUnauthorized && sentTimestampCookie(first.sent) {
-		second, err := postGaiaRotate(ctx, auth, doer, gaiaTimestampCookies)
+	// 401 means the cookies were not accepted. 403 is the same outcome for
+	// this endpoint: gemini-web2api-go treats both as a refused rotation
+	// (often a Chrome device-bound session, or a cookie set it measured as
+	// too wide). Neither is a transport error, and both get the fallbacks.
+	var attempts []GaiaRotateAttempt
+	for _, variant := range planGaiaRotateVariants(auth) {
+		res, err := postGaiaRotate(ctx, auth, doer, variant)
 		if err != nil {
-			return GaiaRotateResult{}, err
+			if len(attempts) == 0 {
+				return GaiaRotateResult{}, err
+			}
+			return GaiaRotateResult{}, rotateFailure(attempts, err)
 		}
-		if second.status >= 200 && second.status < 300 {
-			return finishGaiaRotate(auth, second), nil
+		attempts = append(attempts, rotateAttempt(variant.name, res))
+		if res.status >= 200 && res.status < 300 {
+			return finishGaiaRotate(auth, res), nil
 		}
-		return GaiaRotateResult{}, rotateFailure(second)
+		if !gaiaAuthRefusal(res.status) {
+			return GaiaRotateResult{}, rotateFailure(attempts, nil)
+		}
 	}
-	if first.status < 200 || first.status >= 300 {
-		return GaiaRotateResult{}, rotateFailure(first)
+	return GaiaRotateResult{}, rotateFailure(attempts, nil)
+}
+
+// gaiaAuthRefusal reports whether status is an authentication-style rejection
+// worth retrying with a narrower cookie set. 401 and 403 are both that for
+// RotateCookies. 429 and 5xx are not: another cookie set will not help.
+func gaiaAuthRefusal(status int) bool {
+	return status == http.StatusUnauthorized || status == http.StatusForbidden
+}
+
+type gaiaRotateVariant struct {
+	name   string
+	allow  map[string]struct{}
+	extras map[string]string
+}
+
+// planGaiaRotateVariants is a bounded sequence. The first request is the
+// pair working clients rotate with. A 401/403 then drops the timestamp
+// cookie, then tries the long-lived account cookies with browser fetch
+// metadata. Identical cookie sets are not repeated.
+func planGaiaRotateVariants(auth *libgm.AuthData) []gaiaRotateVariant {
+	stored := storedGaiaCookieNames(auth)
+	candidates := []gaiaRotateVariant{
+		{name: "psid_pair", allow: gaiaPSIDPairAllow},
+		{name: "psid_only", allow: gaiaPSIDOnlyAllow},
+		{name: "account", allow: gaiaAccountStableAllow, extras: gaiaBrowserFetchHeaders},
 	}
-	return finishGaiaRotate(auth, first), nil
+	var planned []gaiaRotateVariant
+	seen := map[string]struct{}{}
+	for _, variant := range candidates {
+		names := variantCookieNames(stored, variant.allow)
+		if len(names) == 0 {
+			continue
+		}
+		// A timestamp cookie alone is not a session. The PSID variants exist
+		// to present __Secure-1PSID, with or without its timestamp partner.
+		if (variant.name == "psid_pair" || variant.name == "psid_only") && !containsString(names, "__Secure-1PSID") {
+			continue
+		}
+		key := strings.Join(names, ",")
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		planned = append(planned, variant)
+	}
+	return planned
+}
+
+func storedGaiaCookieNames(auth *libgm.AuthData) map[string]struct{} {
+	names := map[string]struct{}{}
+	if auth == nil {
+		return names
+	}
+	auth.CookiesLock.RLock()
+	defer auth.CookiesLock.RUnlock()
+	for name := range auth.Cookies {
+		if _, ok := gaiaAccountsCookieAllow[name]; ok {
+			names[name] = struct{}{}
+		}
+	}
+	return names
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func variantCookieNames(stored, allow map[string]struct{}) []string {
+	var names []string
+	for name := range stored {
+		if _, ok := allow[name]; ok {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 type gaiaHTTPResult struct {
-	status        int
-	header        http.Header
-	body          []byte
-	sent          []string
-	dropped       []string
-	omittedPSIDTS bool
+	status  int
+	header  http.Header
+	body    []byte
+	sent    []string
+	dropped []string
 }
 
-func postGaiaRotate(ctx context.Context, auth *libgm.AuthData, doer HTTPDoer, omit map[string]struct{}) (gaiaHTTPResult, error) {
+func postGaiaRotate(ctx context.Context, auth *libgm.AuthData, doer HTTPDoer, variant gaiaRotateVariant) (gaiaHTTPResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, RotateCookiesURL, strings.NewReader(rotateCookiesBody))
 	if err != nil {
 		return gaiaHTTPResult{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "https://accounts.google.com")
+	req.Header.Set("Accept", "*/*")
 	req.Header.Set("User-Agent", util.UserAgent)
-	sent, dropped := attachGaiaRotateCookies(req, auth, omit)
+	for name, value := range variant.extras {
+		req.Header.Set(name, value)
+	}
+	sent, dropped := attachGaiaRotateCookies(req, auth, variant.allow)
 	resp, err := doer.Do(req)
 	if err != nil {
 		return gaiaHTTPResult{}, fmt.Errorf("rotate google cookies: %w", err)
@@ -305,14 +473,12 @@ func postGaiaRotate(ctx context.Context, auth *libgm.AuthData, doer HTTPDoer, om
 	if err != nil {
 		return gaiaHTTPResult{}, fmt.Errorf("rotate google cookies: %w", err)
 	}
-	header := resp.Header.Clone()
 	return gaiaHTTPResult{
-		status:        resp.StatusCode,
-		header:        header,
-		body:          body,
-		sent:          sent,
-		dropped:       dropped,
-		omittedPSIDTS: omit != nil,
+		status:  resp.StatusCode,
+		header:  resp.Header.Clone(),
+		body:    body,
+		sent:    sent,
+		dropped: dropped,
 	}, nil
 }
 
@@ -323,39 +489,78 @@ func finishGaiaRotate(auth *libgm.AuthData, res gaiaHTTPResult) GaiaRotateResult
 	return GaiaRotateResult{UpdatedNames: changed, NextWait: wait}
 }
 
-func rotateFailure(res gaiaHTTPResult) error {
-	cause := error(ErrGaiaCookiesRejected)
-	if res.status != http.StatusUnauthorized && res.status != http.StatusForbidden {
-		cause = fmt.Errorf("rotate google cookies: HTTP %d", res.status)
-	}
+func rotateAttempt(variant string, res gaiaHTTPResult) GaiaRotateAttempt {
 	contentType := ""
 	if res.header != nil {
 		contentType = res.header.Get("Content-Type")
 	}
-	return &GaiaRotateError{
-		Status:        res.status,
-		Sent:          res.sent,
-		Received:      responseCookieNames(res.header),
-		Dropped:       res.dropped,
-		ContentType:   contentType,
-		BodyLen:       len(res.body),
-		OmittedPSIDTS: res.omittedPSIDTS,
-		Err:           cause,
+	return GaiaRotateAttempt{
+		Variant:         variant,
+		Status:          res.status,
+		Sent:            res.sent,
+		Received:        responseCookieNames(res.header),
+		Dropped:         res.dropped,
+		ContentType:     contentType,
+		BodyLen:         len(res.body),
+		ResponseHeaders: responseHeaderNames(res.header),
 	}
 }
 
-func attachGaiaRotateCookies(req *http.Request, auth *libgm.AuthData, omit map[string]struct{}) (sent, dropped []string) {
+func rotateFailure(attempts []GaiaRotateAttempt, cause error) error {
+	last := GaiaRotateAttempt{}
+	if len(attempts) > 0 {
+		last = attempts[len(attempts)-1]
+	}
+	if cause == nil {
+		if gaiaAuthRefusal(last.Status) {
+			cause = ErrGaiaCookiesRejected
+		} else {
+			cause = fmt.Errorf("rotate google cookies: HTTP %d", last.Status)
+		}
+	}
+	return &GaiaRotateError{
+		Status:          last.Status,
+		Sent:            last.Sent,
+		Received:        last.Received,
+		Dropped:         last.Dropped,
+		ContentType:     last.ContentType,
+		BodyLen:         last.BodyLen,
+		OmittedPSIDTS:   attemptsOmittedPSIDTS(attempts),
+		ResponseHeaders: last.ResponseHeaders,
+		Attempts:        attempts,
+		Err:             cause,
+	}
+}
+
+func attemptsOmittedPSIDTS(attempts []GaiaRotateAttempt) bool {
+	sawTimestamp := false
+	for _, attempt := range attempts {
+		has := false
+		for _, name := range attempt.Sent {
+			if _, ok := gaiaTimestampCookies[name]; ok {
+				has = true
+				break
+			}
+		}
+		if sawTimestamp && !has {
+			return true
+		}
+		if has {
+			sawTimestamp = true
+		}
+	}
+	return false
+}
+
+func attachGaiaRotateCookies(req *http.Request, auth *libgm.AuthData, allow map[string]struct{}) (sent, dropped []string) {
 	if auth == nil {
 		return nil, nil
 	}
 	auth.CookiesLock.RLock()
 	defer auth.CookiesLock.RUnlock()
-	names := make([]string, 0, len(gaiaAccountsCookieAllow))
+	names := make([]string, 0, len(allow))
 	for name := range auth.Cookies {
-		if _, ok := gaiaAccountsCookieAllow[name]; !ok {
-			continue
-		}
-		if _, skip := omit[name]; skip {
+		if _, ok := allow[name]; !ok {
 			continue
 		}
 		names = append(names, name)
@@ -394,13 +599,16 @@ func cookieValueSendable(value string) bool {
 	return true
 }
 
-func sentTimestampCookie(sent []string) bool {
-	for _, name := range sent {
-		if _, ok := gaiaTimestampCookies[name]; ok {
-			return true
-		}
+func responseHeaderNames(header http.Header) []string {
+	if len(header) == 0 {
+		return nil
 	}
-	return false
+	names := make([]string, 0, len(header))
+	for name := range header {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func responseCookieNames(header http.Header) []string {
