@@ -48,6 +48,11 @@ type Adapter struct {
 	starting bool
 
 	ingressErrors atomic.Uint64
+
+	// rotateCookies, when set, replaces accounts.google.com/RotateCookies.
+	// Tests use it so a generation start does not touch the network. Nil
+	// calls client.RotateGaiaCookies.
+	rotateCookies func(context.Context, *libgm.AuthData) (client.GaiaRotateResult, error)
 }
 
 func New(accountID string, host *app.App, canRepair func() bool) *Adapter {
@@ -190,7 +195,35 @@ func (a *Adapter) Start(
 	installed = true
 	a.mu.Unlock()
 
-	if err := transport.Connect(); err != nil {
+	// PSIDTS expires on a roughly thirty-minute clock. Refresh before the
+	// token request so a process that was asleep, or a session whose previous
+	// generation already rotated, connects with current cookies.
+	refreshCtx, refreshCancel := context.WithTimeout(ctx, client.GaiaRotateTimeout)
+	res, refreshErr := r.refreshGaiaCookies(refreshCtx)
+	refreshCancel()
+	switch {
+	case refreshErr != nil && !errors.Is(refreshErr, client.ErrGaiaCookiesUnavailable):
+		r.firstRotateWait = time.Minute
+	case res.NextWait > 0:
+		r.firstRotateWait = res.NextWait
+	}
+
+	err = transport.Connect()
+	if err != nil && app.IsGoogleAuthExpiredError(err) {
+		// The pre-connect refresh is throttled for a minute after it runs.
+		// This second call only reaches Google when that attempt did not, and
+		// Connect is retried only when this call itself minted new cookies.
+		retryCtx, retryCancel := context.WithTimeout(ctx, client.GaiaRotateTimeout)
+		res, refreshErr = r.refreshGaiaCookies(retryCtx)
+		retryCancel()
+		if refreshErr == nil && res.NextWait > 0 {
+			r.firstRotateWait = res.NextWait
+		}
+		if refreshErr == nil && len(res.UpdatedNames) > 0 {
+			err = transport.Connect()
+		}
+	}
+	if err != nil {
 		failure := a.classifyTransportError(err, "connect", "connect_failed")
 		r.applyFailureStatus(failure)
 		r.closeAdmission()
@@ -218,6 +251,7 @@ func (a *Adapter) ReportError(err error) bool {
 	}
 	defer r.callbacks.Done()
 	failure := a.classifyTransportError(err, "operation", "operation_failed")
+	failure = r.downgradeIfCookiesRefreshed(failure)
 	r.applyFailureStatus(failure)
 	r.requestFinish(failure)
 	return true
@@ -350,6 +384,11 @@ type run struct {
 	lastActivityAt     time.Time
 	lastActivityDetail string
 	phoneNotResponding bool
+
+	// firstRotateWait is the delay before the first periodic RotateCookies
+	// call. Start writes it before coordinate launches the loop; the loop
+	// reads it once. Later rotations keep their own timer.
+	firstRotateWait time.Duration
 }
 
 func (r *run) Ready() <-chan struct{} { return r.ready }
@@ -414,13 +453,130 @@ func (r *run) Stop(ctx context.Context) error {
 	}
 }
 
+const googleCookiesRotatedFingerprint = "google_cookies_rotated"
+
+// refreshGaiaCookies asks accounts.google.com to mint a new PSIDTS pair and
+// writes the result into session.json. Sessions without account cookies are
+// skipped. Cookie values are never logged.
+func (r *run) refreshGaiaCookies(ctx context.Context) (client.GaiaRotateResult, error) {
+	if r == nil || r.generation == nil || r.generation.Client == nil || r.generation.Client.GM == nil {
+		return client.GaiaRotateResult{}, client.ErrGaiaCookiesUnavailable
+	}
+	auth := r.generation.Client.GM.AuthData
+	if !client.HasGaiaAccountCookies(auth) {
+		return client.GaiaRotateResult{}, client.ErrGaiaCookiesUnavailable
+	}
+	var (
+		res client.GaiaRotateResult
+		err error
+	)
+	if r.adapter != nil && r.adapter.rotateCookies != nil {
+		res, err = r.adapter.rotateCookies(ctx, auth)
+	} else {
+		res, err = client.RotateGaiaCookies(ctx, auth, nil)
+	}
+	if err != nil {
+		if !errors.Is(err, client.ErrGaiaCookiesUnavailable) && r.adapter != nil && r.adapter.host != nil {
+			r.adapter.host.Logger.Warn().Err(err).Msg("Google cookie rotation failed")
+		}
+		return res, err
+	}
+	if len(res.UpdatedNames) == 0 {
+		return res, nil
+	}
+	if r.generation.Handler != nil {
+		if perr := r.generation.Handler.PersistCookiesNow(); perr != nil {
+			if r.adapter != nil && r.adapter.host != nil {
+				r.adapter.host.Logger.Warn().Err(perr).Msg("Failed to persist rotated Google cookies")
+			}
+			return res, perr
+		}
+	}
+	if r.adapter != nil && r.adapter.host != nil {
+		r.adapter.host.Logger.Info().
+			Strs("cookies", res.UpdatedNames).
+			Msg("Rotated Google account cookies")
+	}
+	return res, nil
+}
+
+// downgradeIfCookiesRefreshed turns an auth rejection into a transient
+// reconnect when RotateCookies just minted new cookies. The stored linked
+// device is still valid; only the short-lived PSIDTS had gone stale. A
+// rejection that rotation cannot fix keeps its original class so the
+// supervisor can import Chrome cookies or ask for a re-pair.
+func (r *run) downgradeIfCookiesRefreshed(failure bridge.OpError) bridge.OpError {
+	if r == nil || !app.IsGoogleAuthExpiredError(failure.Cause) {
+		return failure
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), client.GaiaRotateTimeout)
+	defer cancel()
+	res, err := r.refreshGaiaCookies(ctx)
+	recovered := err == nil && len(res.UpdatedNames) > 0
+	if err == nil && res.Throttled && client.GaiaCookiesRotatedRecently(client.GaiaRotateRecentWindow) {
+		// The long-poll that just failed was signed with the previous PSIDTS.
+		// The fresh cookies are already on disk; reconnect onto them.
+		recovered = true
+	}
+	if !recovered {
+		return failure
+	}
+	failure.Class = bridge.FailureTransient
+	failure.Fingerprint = googleCookiesRotatedFingerprint
+	failure.Cause = fmt.Errorf("refreshed Google session cookies after rejection: %w", failure.Cause)
+	return failure
+}
+
+func (r *run) rotateCookiesPeriodically(ctx context.Context) {
+	if r == nil || r.generation == nil || r.generation.Client == nil || r.generation.Client.GM == nil ||
+		!client.HasGaiaAccountCookies(r.generation.Client.GM.AuthData) {
+		return
+	}
+	wait := r.firstRotateWait
+	if wait <= 0 {
+		wait = client.DefaultGaiaRotateInterval
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			refreshCtx, cancel := context.WithTimeout(ctx, client.GaiaRotateTimeout)
+			res, err := r.refreshGaiaCookies(refreshCtx)
+			cancel()
+			wait := client.DefaultGaiaRotateInterval
+			if err == nil && res.NextWait > 0 {
+				wait = res.NextWait
+			} else if err != nil {
+				// A blip should not wait out the full interval, and it must
+				// not spin. The rotation claim already enforces a one-minute
+				// floor.
+				wait = time.Minute
+			}
+			timer.Reset(wait)
+		}
+	}
+}
+
 func (r *run) coordinate(ctx context.Context) {
+	rotCtx, rotCancel := context.WithCancel(ctx)
+	var rotWG sync.WaitGroup
+	rotWG.Add(1)
+	go func() {
+		defer rotWG.Done()
+		r.rotateCookiesPeriodically(rotCtx)
+	}()
+
 	var terminal error
 	select {
 	case terminal = <-r.finish:
 	case <-ctx.Done():
 		terminal = ctx.Err()
 	}
+	rotCancel()
+	rotWG.Wait()
 
 	r.closeAdmission()
 	r.transport.SetEventHandler(nil)
@@ -502,6 +658,7 @@ func (r *run) handleEvent(evt any) {
 	r.teeIngress(evt, eventAt)
 	r.generation.Handler.Handle(evt)
 	if failure, terminal := r.classifyEvent(evt); terminal {
+		failure = r.downgradeIfCookiesRefreshed(failure)
 		if failure.Class == bridge.FailureCredentialsExpired ||
 			failure.Class == bridge.FailureUpgradeRequired {
 			r.applyFailureStatus(failure)

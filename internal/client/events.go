@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -413,6 +414,47 @@ func (h *EventHandler) handleAuthRefresh() {
 		return
 	}
 	h.Logger.Debug().Msg("Saved refreshed auth token")
+}
+
+// PersistCookiesNow writes the current auth data, including any cookies just
+// applied from RotateCookies, without waiting for the inbound-event throttle.
+// A generation restart loads session.json, so a refresh that stays only in
+// memory is lost on the next connect.
+func (h *EventHandler) PersistCookiesNow() error {
+	if h == nil || h.Client == nil || h.Client.GM == nil || h.Client.GM.AuthData == nil || h.SessionPath == "" {
+		return fmt.Errorf("google session is not ready to persist cookies")
+	}
+	now := time.Now()
+	if h.Now != nil {
+		now = h.Now()
+	}
+	interval := h.PersistCookiesEvery
+	if interval == 0 {
+		interval = 5 * time.Minute
+	}
+
+	h.cookieSaveMu.Lock()
+	defer h.cookieSaveMu.Unlock()
+
+	authData := h.Client.GM.AuthData
+	authData.CookiesLock.RLock()
+	cookiesJSON, err := json.Marshal(authData.Cookies)
+	if err != nil {
+		authData.CookiesLock.RUnlock()
+		return fmt.Errorf("marshal rotated Google cookies: %w", err)
+	}
+	sessionData, err := h.Client.SessionData()
+	authData.CookiesLock.RUnlock()
+	if err != nil {
+		return fmt.Errorf("get session data for rotated cookie save: %w", err)
+	}
+	if err := SaveSession(h.SessionPath, sessionData); err != nil {
+		return fmt.Errorf("persist rotated Google cookies: %w", err)
+	}
+	h.lastCookieHash = sha256.Sum256(cookiesJSON)
+	h.nextCookieSaveAt = now.Add(interval)
+	h.Logger.Debug().Msg("persisted rotated Google cookies")
+	return nil
 }
 
 func (h *EventHandler) maybePersistRotatedCookies() {

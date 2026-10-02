@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/maxghenis/openmessage/internal/client"
 	"github.com/rs/zerolog"
+	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/events"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 	"google.golang.org/protobuf/proto"
@@ -370,6 +372,41 @@ func TestHandleGoogleAuthExpiredErrorMarksDisconnected(t *testing.T) {
 
 	if a.HandleGoogleAuthExpiredError(errors.New("temporary failure in name resolution")) {
 		t.Fatal("network errors should not be treated as auth expiry")
+	}
+}
+
+func TestLoadAndConnectPersistsRotatedGaiaCookies(t *testing.T) {
+	orig := refreshGaiaCookies
+	t.Cleanup(func() { refreshGaiaCookies = orig })
+	refreshGaiaCookies = func(_ context.Context, auth *libgm.AuthData, _ client.HTTPDoer) (client.GaiaRotateResult, error) {
+		auth.SetCookies(map[string]string{
+			"SID":              "sid-old",
+			"SAPISID":          "sap-old",
+			"__Secure-1PSIDTS": "psidts-new",
+		})
+		return client.GaiaRotateResult{UpdatedNames: []string{"__Secure-1PSIDTS"}}, nil
+	}
+
+	sessionPath := filepath.Join(t.TempDir(), "session.json")
+	if err := client.SaveSession(sessionPath, &client.SessionData{
+		AuthDataJSON: []byte(`{"cookies":{"SID":"sid-old","SAPISID":"sap-old","__Secure-1PSIDTS":"psidts-old"}}`),
+	}); err != nil {
+		t.Fatalf("SaveSession(): %v", err)
+	}
+	var logs strings.Builder
+	a := &App{SessionPath: sessionPath, Logger: zerolog.New(&logs)}
+	if err := a.LoadAndConnect(); err == nil {
+		t.Fatal("session without an auth token should not connect")
+	}
+	loaded, err := client.LoadSession(sessionPath)
+	if err != nil {
+		t.Fatalf("LoadSession(): %v", err)
+	}
+	if !strings.Contains(string(loaded.AuthDataJSON), "psidts-new") || strings.Contains(string(loaded.AuthDataJSON), "psidts-old") {
+		t.Fatalf("session cookies = %s", loaded.AuthDataJSON)
+	}
+	if strings.Contains(logs.String(), "psidts-new") || strings.Contains(logs.String(), "psidts-old") || strings.Contains(logs.String(), "sid-old") {
+		t.Fatalf("log included a cookie value: %s", logs.String())
 	}
 }
 

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/user"
@@ -509,6 +510,10 @@ func (a *App) setClient(cli *client.Client) {
 	a.Client = cli
 }
 
+// refreshGaiaCookies is the one-shot RotateCookies call used by commands that
+// connect a stored session outside the supervisor. Tests replace it.
+var refreshGaiaCookies = client.RotateGaiaCookies
+
 func (a *App) LoadAndConnect() error {
 	sessionData, err := client.LoadSession(a.SessionPath)
 	if err != nil {
@@ -571,6 +576,24 @@ func (a *App) LoadAndConnect() error {
 			a.Logger.Warn().Msg("Disconnected from Google Messages")
 		},
 	}
+	if client.HasGaiaAccountCookies(cli.GM.AuthData) {
+		// The daemon's supervisor refreshes on its own schedule. This covers
+		// one-shot commands (send, debug) that connect the stored session
+		// directly and would otherwise present the pair-time PSIDTS.
+		refreshCtx, cancel := context.WithTimeout(context.Background(), client.GaiaRotateTimeout)
+		res, err := refreshGaiaCookies(refreshCtx, cli.GM.AuthData, nil)
+		cancel()
+		if err != nil {
+			a.Logger.Warn().Err(err).Msg("Google cookie rotation before connect failed")
+		} else if len(res.UpdatedNames) > 0 {
+			if err := a.EventHandler.PersistCookiesNow(); err != nil {
+				a.Logger.Warn().Err(err).Msg("Failed to persist rotated Google cookies")
+			} else {
+				a.Logger.Info().Strs("cookies", res.UpdatedNames).Msg("Rotated Google account cookies")
+			}
+		}
+	}
+
 	// Wrap the handler so a panic on a malformed event can't kill libgm's
 	// single long-poll goroutine (it has no recover() of its own). A dead
 	// goroutine would freeze SMS while Connected stayed true — the zombie. On

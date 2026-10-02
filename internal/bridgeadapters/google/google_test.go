@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -88,6 +89,135 @@ func TestEventFailureClassification(t *testing.T) {
 				t.Fatalf("class = %q, want %q", failure.Class, test.wantClass)
 			}
 		})
+	}
+}
+
+func TestListenFatalAuthExpiryRotatesBeforeParking(t *testing.T) {
+	client.ResetGaiaCookieRotationState()
+	t.Cleanup(client.ResetGaiaCookieRotationState)
+
+	host := newTestApp(t)
+	var logs strings.Builder
+	host.Logger = zerolog.New(&logs)
+	legacy := gaiaLegacyClient(t)
+	fake := &fakeTransport{}
+	// Repair is unavailable, so an unrecoverable 401 would park the session
+	// (upgrade required) instead of asking Chrome for cookies.
+	a := New("google-primary", host, func() bool { return false })
+	a.newClient = func() (*client.Client, transportClient, error) {
+		return legacy, fake, nil
+	}
+	calls := 0
+	a.rotateCookies = func(context.Context, *libgm.AuthData) (client.GaiaRotateResult, error) {
+		calls++
+		if calls == 1 {
+			return client.GaiaRotateResult{NextWait: 10 * time.Minute}, nil
+		}
+		legacy.GM.AuthData.SetCookies(map[string]string{
+			"SID":              "sid-old",
+			"SAPISID":          "sap-old",
+			"__Secure-1PSIDTS": "psidts-new",
+		})
+		return client.GaiaRotateResult{
+			UpdatedNames: []string{"__Secure-1PSIDTS"},
+			NextWait:     8 * time.Minute,
+		}, nil
+	}
+
+	run, err := a.Start(context.Background(), bridge.StartRequest{
+		AccountID:  "google-primary",
+		Generation: 1,
+	}, nil)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { stopRun(t, run) })
+
+	fake.emit(&events.ListenFatalError{
+		Error: errors.New("HTTP 401: 16: Request had invalid authentication credentials"),
+	})
+	terminalError(t, run.Done(), bridge.FailureTransient)
+	status := host.GoogleStatus()
+	if status.AuthExpired {
+		t.Fatal("rotated cookies were still marked auth-expired")
+	}
+	if status.NeedsRepair {
+		t.Fatal("rotated cookies parked the session for manual repair")
+	}
+	if strings.Contains(logs.String(), "psidts-new") || strings.Contains(logs.String(), "psidts-old") {
+		t.Fatalf("log included a cookie value: %s", logs.String())
+	}
+	loaded, err := client.LoadSession(host.SessionPath)
+	if err != nil {
+		t.Fatalf("LoadSession(): %v", err)
+	}
+	if !strings.Contains(string(loaded.AuthDataJSON), "psidts-new") {
+		t.Fatalf("session was not updated with the rotated cookie: %s", loaded.AuthDataJSON)
+	}
+}
+
+func TestListenFatalAuthExpiryStaysParkedWhenRotationIsRejected(t *testing.T) {
+	client.ResetGaiaCookieRotationState()
+	t.Cleanup(client.ResetGaiaCookieRotationState)
+
+	host := newTestApp(t)
+	legacy := gaiaLegacyClient(t)
+	fake := &fakeTransport{}
+	a := newTestAdapter(t, host, fake)
+	a.newClient = func() (*client.Client, transportClient, error) {
+		return legacy, fake, nil
+	}
+	a.rotateCookies = func(context.Context, *libgm.AuthData) (client.GaiaRotateResult, error) {
+		return client.GaiaRotateResult{}, client.ErrGaiaCookiesRejected
+	}
+
+	run, err := a.Start(context.Background(), bridge.StartRequest{
+		AccountID:  "google-primary",
+		Generation: 1,
+	}, nil)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { stopRun(t, run) })
+	fake.emit(&events.ListenFatalError{
+		Error: errors.New("HTTP 401: 16: Request had invalid authentication credentials"),
+	})
+	terminalError(t, run.Done(), bridge.FailureCredentialsExpired)
+	if !host.GoogleStatus().AuthExpired {
+		t.Fatal("rejected rotation should still mark the session auth-expired")
+	}
+}
+
+func TestListenFatalAuthExpiryReconnectsAfterARecentRotation(t *testing.T) {
+	client.ResetGaiaCookieRotationState()
+	t.Cleanup(client.ResetGaiaCookieRotationState)
+	client.NoteGaiaCookieRotationForTest(time.Now())
+
+	host := newTestApp(t)
+	legacy := gaiaLegacyClient(t)
+	fake := &fakeTransport{}
+	a := newTestAdapter(t, host, fake)
+	a.newClient = func() (*client.Client, transportClient, error) {
+		return legacy, fake, nil
+	}
+	a.rotateCookies = func(context.Context, *libgm.AuthData) (client.GaiaRotateResult, error) {
+		return client.GaiaRotateResult{Throttled: true, NextWait: time.Minute}, nil
+	}
+
+	run, err := a.Start(context.Background(), bridge.StartRequest{
+		AccountID:  "google-primary",
+		Generation: 1,
+	}, nil)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { stopRun(t, run) })
+	fake.emit(&events.ListenFatalError{
+		Error: errors.New("HTTP 401: 16: Request had invalid authentication credentials"),
+	})
+	terminalError(t, run.Done(), bridge.FailureTransient)
+	if host.GoogleStatus().AuthExpired {
+		t.Fatal("a 401 immediately after rotation should reconnect, not park")
 	}
 }
 
@@ -778,6 +908,17 @@ func newTestApp(t *testing.T) *app.App {
 	}
 	t.Cleanup(host.Close)
 	return host
+}
+
+func gaiaLegacyClient(t *testing.T) *client.Client {
+	t.Helper()
+	legacy := newLegacyClient(t)
+	legacy.GM.AuthData.SetCookies(map[string]string{
+		"SID":              "sid-old",
+		"SAPISID":          "sap-old",
+		"__Secure-1PSIDTS": "psidts-old",
+	})
+	return legacy
 }
 
 func newLegacyClient(t *testing.T) *client.Client {

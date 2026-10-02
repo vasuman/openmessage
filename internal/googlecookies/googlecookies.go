@@ -2,15 +2,19 @@
 // OpenMessage's session.json from a local Chrome profile.
 //
 // Google-account libgm sessions authenticate with five .google.com account
-// cookies (SID, HSID, SSID, APISID, and SAPISID) plus SAPISIDHASH. The cookies
-// rotate roughly every 30 minutes. When the backend has been offline long
-// enough (laptop asleep, travel), the stored cookies expire and every token
-// refresh returns HTTP 401 — the session looks dead, but the phone-side device
-// link is usually still intact. Rewriting auth_data.cookies with fresh values
-// from the user's signed-in Chrome profile and reconnecting revives it with no
-// re-pairing. A messages.google.com OSID cookie exists only when the user has
-// used Messages for web in that Chrome profile; it is carried when present but
-// is never required.
+// cookies (SID, HSID, SSID, APISID, and SAPISID) plus SAPISIDHASH. Google also
+// expects the client to refresh __Secure-1PSIDTS about every ten minutes via
+// accounts.google.com/RotateCookies; a session that never does starts failing
+// pings and long-polls after roughly thirty minutes. The live client performs
+// that refresh itself (internal/client.RotateGaiaCookies). This package remains
+// the fallback for when those stored cookies are rejected outright — typically
+// because the backend was offline long enough (laptop asleep, travel) that
+// RotateCookies no longer accepts them. The phone-side device link is usually
+// still intact, so rewriting auth_data.cookies from the signed-in Chrome
+// profile and reconnecting revives it with no re-pairing. A
+// messages.google.com OSID cookie exists only when the user has used Messages
+// for web in that Chrome profile; it is carried when present but is never
+// required.
 //
 // This is the native (in-process) equivalent of
 // scripts/refresh-google-session-cookies-{linux,macos}.py, so app installs

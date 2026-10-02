@@ -18,9 +18,11 @@ type SessionData struct {
 //
 // This matters because session.json holds the live Google/WhatsApp/Signal
 // credentials and is no longer a rarely-touched file: rotated Google cookies
-// are persisted every few minutes (see EventHandler.maybePersistRotatedCookies),
-// so an in-place rewrite would put a truncation window in front of the paired
-// auth several hundred times a day. Losing it costs a manual re-pair.
+// are persisted every few minutes (see EventHandler.maybePersistRotatedCookies)
+// and immediately after accounts.google.com/RotateCookies
+// (EventHandler.PersistCookiesNow), so an in-place rewrite would put a
+// truncation window in front of the paired auth several hundred times a day.
+// Losing it costs a manual re-pair.
 // internal/googlecookies.UpdateSessionCookies writes the same file the same way.
 func SaveSession(path string, data *SessionData) error {
 	dir := filepath.Dir(path)
