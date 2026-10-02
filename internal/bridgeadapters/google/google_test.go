@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -153,6 +154,85 @@ func TestListenFatalAuthExpiryRotatesBeforeParking(t *testing.T) {
 	}
 	if !strings.Contains(string(loaded.AuthDataJSON), "psidts-new") {
 		t.Fatalf("session was not updated with the rotated cookie: %s", loaded.AuthDataJSON)
+	}
+}
+
+func TestStartStaysUpWhenCookieRotationIsRejected(t *testing.T) {
+	client.ResetGaiaCookieRotationState()
+	t.Cleanup(client.ResetGaiaCookieRotationState)
+
+	host := newTestApp(t)
+	var logs strings.Builder
+	host.Logger = zerolog.New(&logs)
+	legacy := gaiaLegacyClient(t)
+	fake := &fakeTransport{}
+	a := New("google-primary", host, func() bool { return false })
+	a.newClient = func() (*client.Client, transportClient, error) {
+		return legacy, fake, nil
+	}
+	const secret = "psidts-must-not-appear"
+	a.rotateCookies = func(context.Context, *libgm.AuthData) (client.GaiaRotateResult, error) {
+		return client.GaiaRotateResult{}, &client.GaiaRotateError{
+			Status:        http.StatusUnauthorized,
+			Sent:          []string{"SID", "__Secure-1PSID", "__Secure-1PSIDTS"},
+			Received:      []string{"NID"},
+			ContentType:   "text/html; charset=utf-8",
+			BodyLen:       42,
+			OmittedPSIDTS: true,
+			Err:           client.ErrGaiaCookiesRejected,
+		}
+	}
+
+	started, err := a.Start(context.Background(), bridge.StartRequest{
+		AccountID:  "google-primary",
+		Generation: 1,
+	}, nil)
+	if err != nil {
+		t.Fatalf("Start() error = %v; a rejected rotation must not fail connect", err)
+	}
+	t.Cleanup(func() { stopRun(t, started) })
+	select {
+	case terminal := <-started.Done():
+		t.Fatalf("rejected rotation ended the generation: %v", terminal)
+	default:
+	}
+	if host.GoogleStatus().AuthExpired {
+		t.Fatal("rejected rotation marked the session auth-expired")
+	}
+	concrete, ok := started.(*run)
+	if !ok || concrete.firstRotateWait != client.DefaultGaiaRotateInterval {
+		t.Fatalf("firstRotateWait = %s, want %s", concrete.firstRotateWait, client.DefaultGaiaRotateInterval)
+	}
+	logged := logs.String()
+	for _, want := range []string{
+		"Google cookie rotation failed",
+		`"status":401`,
+		"__Secure-1PSIDTS",
+		`"content_type":"text/html; charset=utf-8"`,
+		`"body_len":42`,
+		`"omitted_psidts":true`,
+	} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("log %q missing %q", logged, want)
+		}
+	}
+	if strings.Contains(logged, secret) {
+		t.Fatalf("log included a cookie value: %s", logged)
+	}
+}
+
+func TestGaiaRotateWait(t *testing.T) {
+	if got := gaiaRotateWait(client.GaiaRotateResult{}, client.ErrGaiaCookiesRejected, true); got != client.DefaultGaiaRotateInterval {
+		t.Fatalf("rejected wait = %s", got)
+	}
+	if got := gaiaRotateWait(client.GaiaRotateResult{}, errors.New("timeout"), false); got != time.Minute {
+		t.Fatalf("blip wait = %s", got)
+	}
+	if got := gaiaRotateWait(client.GaiaRotateResult{NextWait: 8 * time.Minute}, nil, true); got != 8*time.Minute {
+		t.Fatalf("success wait = %s", got)
+	}
+	if got := gaiaRotateWait(client.GaiaRotateResult{}, client.ErrGaiaCookiesUnavailable, true); got != 0 {
+		t.Fatalf("unavailable initial wait = %s", got)
 	}
 }
 

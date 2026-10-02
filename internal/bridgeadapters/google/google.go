@@ -198,14 +198,16 @@ func (a *Adapter) Start(
 	// PSIDTS expires on a roughly thirty-minute clock. Refresh before the
 	// token request so a process that was asleep, or a session whose previous
 	// generation already rotated, connects with current cookies.
+	//
+	// A failed rotation does not stop Connect. Messages still authenticates
+	// with the long-lived account cookies, and GoogleGeneration.Ready logs
+	// "Connected to Google Messages" only after the long-poll is up. That is
+	// why a rotation warning can be followed by a connected line.
 	refreshCtx, refreshCancel := context.WithTimeout(ctx, client.GaiaRotateTimeout)
 	res, refreshErr := r.refreshGaiaCookies(refreshCtx)
 	refreshCancel()
-	switch {
-	case refreshErr != nil && !errors.Is(refreshErr, client.ErrGaiaCookiesUnavailable):
-		r.firstRotateWait = time.Minute
-	case res.NextWait > 0:
-		r.firstRotateWait = res.NextWait
+	if wait := gaiaRotateWait(res, refreshErr, true); wait > 0 {
+		r.firstRotateWait = wait
 	}
 
 	err = transport.Connect()
@@ -216,10 +218,10 @@ func (a *Adapter) Start(
 		retryCtx, retryCancel := context.WithTimeout(ctx, client.GaiaRotateTimeout)
 		res, refreshErr = r.refreshGaiaCookies(retryCtx)
 		retryCancel()
-		if refreshErr == nil && res.NextWait > 0 {
-			r.firstRotateWait = res.NextWait
-		}
 		if refreshErr == nil && len(res.UpdatedNames) > 0 {
+			if res.NextWait > 0 {
+				r.firstRotateWait = res.NextWait
+			}
 			err = transport.Connect()
 		}
 	}
@@ -455,6 +457,27 @@ func (r *run) Stop(ctx context.Context) error {
 
 const googleCookiesRotatedFingerprint = "google_cookies_rotated"
 
+// gaiaRotateWait is the delay until the next RotateCookies attempt.
+// initial is the pre-connect call: no account cookies leaves the wait at
+// zero. A rejection waits out the normal interval instead of retrying every
+// minute, so a browser that is still rotating the same session is not fought
+// while Messages itself stays connected. Other errors retry sooner.
+func gaiaRotateWait(res client.GaiaRotateResult, err error, initial bool) time.Duration {
+	if errors.Is(err, client.ErrGaiaCookiesRejected) {
+		return client.DefaultGaiaRotateInterval
+	}
+	if err != nil && !errors.Is(err, client.ErrGaiaCookiesUnavailable) {
+		return time.Minute
+	}
+	if err == nil && res.NextWait > 0 {
+		return res.NextWait
+	}
+	if initial {
+		return 0
+	}
+	return client.DefaultGaiaRotateInterval
+}
+
 // refreshGaiaCookies asks accounts.google.com to mint a new PSIDTS pair and
 // writes the result into session.json. Sessions without account cookies are
 // skipped. Cookie values are never logged.
@@ -477,7 +500,7 @@ func (r *run) refreshGaiaCookies(ctx context.Context) (client.GaiaRotateResult, 
 	}
 	if err != nil {
 		if !errors.Is(err, client.ErrGaiaCookiesUnavailable) && r.adapter != nil && r.adapter.host != nil {
-			r.adapter.host.Logger.Warn().Err(err).Msg("Google cookie rotation failed")
+			client.AnnotateGaiaRotateLog(r.adapter.host.Logger.Warn(), err).Msg("Google cookie rotation failed")
 		}
 		return res, err
 	}
@@ -546,16 +569,7 @@ func (r *run) rotateCookiesPeriodically(ctx context.Context) {
 			refreshCtx, cancel := context.WithTimeout(ctx, client.GaiaRotateTimeout)
 			res, err := r.refreshGaiaCookies(refreshCtx)
 			cancel()
-			wait := client.DefaultGaiaRotateInterval
-			if err == nil && res.NextWait > 0 {
-				wait = res.NextWait
-			} else if err != nil {
-				// A blip should not wait out the full interval, and it must
-				// not spin. The rotation claim already enforces a one-minute
-				// floor.
-				wait = time.Minute
-			}
-			timer.Reset(wait)
+			timer.Reset(gaiaRotateWait(res, err, false))
 		}
 	}
 }

@@ -584,7 +584,7 @@ func (a *App) LoadAndConnect() error {
 		res, err := refreshGaiaCookies(refreshCtx, cli.GM.AuthData, nil)
 		cancel()
 		if err != nil {
-			a.Logger.Warn().Err(err).Msg("Google cookie rotation before connect failed")
+			client.AnnotateGaiaRotateLog(a.Logger.Warn(), err).Msg("Google cookie rotation before connect failed")
 		} else if len(res.UpdatedNames) > 0 {
 			if err := a.EventHandler.PersistCookiesNow(); err != nil {
 				a.Logger.Warn().Err(err).Msg("Failed to persist rotated Google cookies")
